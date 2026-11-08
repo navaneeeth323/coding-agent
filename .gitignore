@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# bughunter state and sandbox output
+.bughunter/
+.bughunter-junit.xml
+*.db
+
+# Environment and secrets
+.env
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Private planning notes
+PLAN.md
