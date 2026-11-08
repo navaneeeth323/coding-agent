@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import ast
 import difflib
+import io
 import re
+import subprocess
+import sys
 import textwrap
+import tokenize
 from pathlib import PurePosixPath
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
 
 _FENCE = re.compile(r"^\s*```[\w+-]*\s*\n(.*?)\n\s*```\s*$", re.S)
 
@@ -64,3 +69,81 @@ def changed_lines(before: str, after: str) -> List[Tuple[int, int]]:
     """Line ranges (1-based, inclusive, in `before`) that the edit touched."""
     sm = difflib.SequenceMatcher(a=before.splitlines(), b=after.splitlines(), autojunk=False)
     return [(i1 + 1, max(i1 + 1, i2)) for tag, i1, i2, _, _ in sm.get_opcodes() if tag != "equal"]
+
+
+def _strip_comments(code: str) -> str:
+    """Remove `#` comments; lines that held only a comment go entirely. Pragmas (noqa, type:) stay."""
+    lines = code.splitlines()
+    dropped: Set[int] = set()
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(code).readline))
+    except (tokenize.TokenError, SyntaxError):
+        return code
+    for tok in tokens:
+        if tok.type != tokenize.COMMENT or re.match(r"#\s*(noqa|type:|pragma)", tok.string):
+            continue
+        row, col = tok.start
+        lines[row - 1] = lines[row - 1][:col].rstrip()
+        if not lines[row - 1].strip():
+            dropped.add(row - 1)
+    return "\n".join(l for i, l in enumerate(lines) if i not in dropped)
+
+
+def _squeeze_blank_lines(code: str) -> str:
+    """At most one blank line inside a block, two before top-level code."""
+    out: List[str] = []
+    blanks = 0
+    for line in code.splitlines():
+        if not line.strip():
+            blanks += 1
+            continue
+        if out:
+            out += [""] * min(blanks, 1 if line[:1].isspace() else 2)
+        blanks = 0
+        out.append(line.rstrip())
+    return "\n".join(out) + "\n"
+
+
+def _remove_unused_imports(code: str) -> str:
+    proc = subprocess.run(
+        [sys.executable, "-m", "ruff", "check", "--isolated", "--no-cache", "--exit-zero", "--select", "F401",
+         "--fix", "--stdin-filename", "test_generated.py", "-"],
+        input=code, capture_output=True, text=True,
+    )
+    return proc.stdout if proc.returncode == 0 and proc.stdout.strip() else code
+
+
+def clean_test_code(code: str) -> str:
+    """Tidy a model-written test before it is run, verified and shown in a PR.
+
+    A small model thinks out loud in comments ("wait, let's check tax"); those, unused
+    imports, trailing whitespace and runs of blank lines go. Behaviour is unchanged.
+    """
+    try:
+        ast.parse(code)
+    except SyntaxError:
+        return code  # leave it for the syntax check to report
+    return _remove_unused_imports(_squeeze_blank_lines(_strip_comments(code)))
+
+
+def _duplicate_defs(tree: ast.AST) -> Set[str]:
+    """Functions/classes defined twice in the same module or class body (decorated ones, like setters, aside)."""
+    out: Set[str] = set()
+
+    def walk(body, prefix: str) -> None:
+        seen: Set[str] = set()
+        for node in body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                if node.name in seen and not node.decorator_list:
+                    out.add(prefix + node.name)
+                seen.add(node.name)
+                if isinstance(node, ast.ClassDef):
+                    walk(node.body, f"{prefix}{node.name}.")
+
+    walk(tree.body, "")
+    return out
+
+
+def new_redefinitions(before: str, after: str) -> List[str]:
+    """Names the edit defines a second time in the same scope, e.g. a fix that pastes in a new `__init__`."""
+    return sorted(_duplicate_defs(ast.parse(after)) - _duplicate_defs(ast.parse(before)))

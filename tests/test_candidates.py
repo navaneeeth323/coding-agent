@@ -123,3 +123,14 @@ def test_collect_end_to_end(repo):
         collect_candidates(idx)
         assert store.queue(idx.conn) == []
         assert sum(store.funnel(idx.conn).values()) == 0
+
+
+def test_ruff_paths_through_a_symlinked_root(tmp_path):
+    from bughunter.candidates.ruff import run_ruff
+
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "a.py").write_text("def f():\n    return undefined_name\n")
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    assert [f.path for f in run_ruff(link, ["a.py"])] == ["a.py"]

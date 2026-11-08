@@ -26,7 +26,8 @@ Each stage cuts down how many items reach the next, so the expensive stages only
 6. **Verify.** On fresh copies of the repo, the fix is accepted only if:
    - the new test fails before the fix and passes after it (each checked twice);
    - the existing test suite has no new failures;
-   - ruff (and mypy, if installed) report nothing new.
+   - ruff (and mypy, if installed) report nothing new, and the new test is lint-clean;
+   - it isn't the same bug as a fix already verified (neither fix makes the other's test pass).
 7. **PR.** Commits the fix and test on a new `bughunter/...` branch in a separate git worktree and opens a **draft** PR through the GitHub REST API. It never pushes to the default branch, checks for duplicate issues and PRs first, and is a dry run unless you pass `--push`.
 
 Every candidate moves through a persisted state machine (`new → triaged → investigating → verified → pr_opened`, or `rejected`), so runs are resumable. Every model call is cached and logged, so you can debug prompts by reading traces.
@@ -47,23 +48,28 @@ python3 -m venv .venv
 
 ## Usage
 
-Run the stages in order against a target repository:
+Run the stages in order from inside the repository you want to check (or pass `--repo path/to/repo` before the stage name):
 
 ```bash
-bughunter --repo path/to/repo index          # build the symbol index
-bughunter --repo path/to/repo candidates     # analyzers, heuristics, git hotspots
-bughunter --repo path/to/repo scan           # LLM reads functions, adds suspicions
-bughunter --repo path/to/repo triage         # LLM judges each candidate
-bughunter --repo path/to/repo sandbox-build  # bake the repo's dependencies into the Docker image
-bughunter --repo path/to/repo investigate    # failing test + fix
-bughunter --repo path/to/repo verify         # the verification gate
-bughunter --repo path/to/repo pr             # dry run: show the PR it would open
-bughunter --repo path/to/repo pr --push      # push the branch and open a draft PR
+bughunter sandbox-build                # once: bake the repo's dependencies into the Docker image
+bughunter test                         # check the existing test suite runs in the sandbox
+
+bughunter index                        # build the symbol index
+bughunter candidates                   # analyzers, heuristics, git hotspots
+bughunter scan --max-functions 100     # LLM reads the riskiest functions, adds suspicions
+bughunter triage                       # LLM judges each candidate
+bughunter investigate                  # failing test + fix
+bughunter verify                       # the verification gate
+
+bughunter queue --state verified       # list the fixes that passed the gate
+bughunter pr                           # dry run: print every PR it would open
+bughunter pr 12 --push                 # push candidate #12's branch and open it as a draft PR
 ```
 
-- Use `bughunter queue` to list candidates in a given state.
-- Use `--model` and `--host` to point at a different Ollama model or server.
-- Without Docker, pass `--sandbox local-unsafe` to run tests in a subprocess with a scrubbed environment. That's only appropriate for code you trust.
+- Each stage only does work that isn't done yet. State is kept in `.bughunter/state.db` inside the repo (`--db` to move it), so stages can be rerun and interrupted safely.
+- Review each dry run before pushing. `pr --push` without ids opens a PR for **every** verified fix.
+- `--model` and `--host` point the LLM stages at a different Ollama model or server.
+- Without Docker, pass `--sandbox local-unsafe` to the stages that run tests (`test`, `investigate`, `verify`). It runs them in a subprocess with a scrubbed environment, which is only appropriate for code you trust.
 
 ## Evaluation
 

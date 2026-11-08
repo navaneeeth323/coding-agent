@@ -88,6 +88,36 @@ def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40] or "fix"
 
 
+CHECK_LABELS = {
+    "fails_before": "New test fails on the current code",
+    "passes_after": "New test passes with the fix",
+    "suite": "Existing test suite has no new failures",
+    "ruff": "ruff: no new warnings",
+    "mypy": "mypy: no new errors",
+    "duplicate": "Not the same bug as another verified fix",
+}
+
+
+def _title(inv: dict, where: str) -> str:
+    title = re.sub(r"\s+", " ", inv.get("title") or "").strip().rstrip(".")
+    if not title:
+        return f"Fix bug in {where}"
+    title = title[0].upper() + title[1:]
+    return title if len(title) <= 72 else title[:69].rstrip() + "..."
+
+
+def _assertion(failure: str, limit: int = 12) -> str:
+    """The `E ...` lines of a pytest failure: what the reviewer needs, without the traceback."""
+    lines = [l for l in failure.splitlines() if l.startswith("E ")]
+    return "\n".join((lines or failure.strip().splitlines())[:limit])
+
+
+def _drop_file(diff: str, path: str) -> str:
+    """A unified diff without one file's section (the new test, already shown in full)."""
+    sections = re.split(r"(?m)^(?=--- )", diff)
+    return "".join(sec for sec in sections if f"\n+++ b/{path}\n" not in sec)
+
+
 def build_plan(c: dict) -> PRPlan:
     data = json.loads(c["data"])
     t, inv, ver = data.get("triage", {}), data["investigation"], data.get("verification", {})
@@ -96,18 +126,24 @@ def build_plan(c: dict) -> PRPlan:
     files[inv["test"]["path"]] = inv["test"]["content"]
 
     summary = inv.get("diagnosis") or t.get("intent") or c["message"]
-    title = f"Fix {t.get('category', 'bug').replace('_', ' ')} in {where} ({c['path']})"
-    checks = "\n".join(f"- {'✅' if ch['ok'] else '❌'} {ch['name']}: {ch['detail']}" for ch in ver.get("checks", []))
+    if c["source"] == "llm":
+        found = "a model read of the function, confirmed by a separate triage pass"
+    else:
+        found = f"{c['source']} `{c['rule']}`: {c['message']}"
+    failure = _assertion(inv["test"].get("failure", ""))
+    observed = f"\nOn the current code it fails with:\n\n```\n{failure}\n```\n" if failure else ""
+    checks = "\n".join(
+        f"- {'✅' if ch['ok'] else '❌'} {CHECK_LABELS.get(ch['name'], ch['name'])}"
+        + (f" ({ch['detail']})" if ch["detail"] and ch["name"] != "duplicate" else "")
+        for ch in ver.get("checks", []) if ch["name"] != "scope"
+    )
     body = f"""\
 ## Bug
 
 {summary}
 
 - Where: `{c['path']}:{c['line']}` in `{where}`
-- Flagged by: {c['source']} `{c['rule']}` ({c['message']})
-- Input: {t.get('failing_input', 'see test')}
-- Expected: {t.get('expected', '')}
-- Actual: {t.get('actual', '')}
+- Found by: {found}
 
 ## Reproduction
 
@@ -116,24 +152,26 @@ def build_plan(c: dict) -> PRPlan:
 ```python
 {inv['test']['content'].strip()}
 ```
-
+{observed}
 ## Fix
 
 ```diff
-{inv['diff'].strip()}
+{_drop_file(inv['diff'], inv['test']['path']).strip()}
 ```
 
-## Confidence
+## Verification
 
-- Triage P(real bug): {t.get('p_real', 'n/a')} (model `{t.get('model', '?')}`)
-- Verification gate (fresh checkouts, sandboxed):
+Run in fresh copies of the repo, sandboxed:
+
 {checks}
+
+Triage confidence that this is a real bug: {t.get('p_real', 'n/a')} (model `{t.get('model', '?')}`)
 
 ---
 Opened as a draft by bughunter, an automated bug-finding agent. Please review before merging.
 """
     return PRPlan(candidate_id=c["id"], branch=f"{BRANCH_PREFIX}{c['id']}-{_slug(where)}",
-                  title=title, body=body, files=files)
+                  title=_title(inv, where), body=body, files=files)
 
 
 def local_duplicates(conn, c: dict) -> List[str]:

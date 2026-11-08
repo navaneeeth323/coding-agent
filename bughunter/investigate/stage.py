@@ -26,7 +26,7 @@ from ..candidates import store
 from ..index import RepoIndex
 from ..llm import JSONChat, LLMError, RecordingLLM
 from ..sandbox import Sandbox, SandboxError, TestRun, Workspace, run_tests, sha1_text
-from .edits import replace_region, strip_fences, unified_diff
+from .edits import clean_test_code, new_redefinitions, replace_region, strip_fences, unified_diff
 from .prompt import Target, fix_messages, fix_schema, repro_messages, repro_schema
 
 RETEST_NOTE = """\
@@ -191,6 +191,7 @@ class Investigator:
             code = strip_fences(data.get("test_code", ""))
             problem = check_test_code(code, target)
             if problem is None:
+                code = clean_test_code(code)
                 ws.write(test_path, code)
                 run = run_tests(self.sandbox, ws.path, [test_path], timeout=self.config.test_timeout)
                 mine = _test_ids(run, test_path)
@@ -216,7 +217,7 @@ class Investigator:
 
     def fix(self, ws: Workspace, target: Target, triage: dict, test_path: str, test_code: str, failure: str,
             budget: Budget, log_: List[dict]):
-        """Returns (new_file_text, diagnosis, None) or (None, reason, suspicion).
+        """Returns (new_file_text, {"diagnosis", "title"}, None) or (None, reason, suspicion).
 
         `suspicion` is set when the evidence points at the test rather than the code:
         the model said so, or every attempt that ran left the test failing.
@@ -246,6 +247,11 @@ class Investigator:
                     ast.parse(patched)
                 except SyntaxError as exc:
                     problem = f"After pasting your code the file has a syntax error: {exc}"
+                else:
+                    twice = new_redefinitions(original, patched)
+                    if twice:
+                        problem = (f"Your code defines {', '.join(f'`{n}`' for n in twice)} a second time, "
+                                   "leaving the old definition in place. Change the code in the region instead.")
             if problem is None:
                 ws.write(target.path, patched)
                 run = run_tests(self.sandbox, ws.path, [test_path], timeout=self.config.test_timeout)
@@ -264,7 +270,7 @@ class Investigator:
                                    + ", ".join(new_failures[:5]) + "\n" + suite.failure_text(40))
                 if problem is None:
                     log_.append({"phase": "fix", "attempt": attempt, "result": "passes"})
-                    return patched, data.get("diagnosis", ""), None
+                    return patched, {"diagnosis": data.get("diagnosis", ""), "title": data.get("title", "")}, None
                 ws.write(target.path, original)
             log_.append({"phase": "fix", "attempt": attempt, "result": "rejected", "problem": problem[:500]})
             feedback += [json.dumps(data), problem + "\nReturn the corrected complete region."]
@@ -296,7 +302,7 @@ class Investigator:
                     if test_code is None:
                         record["reason"] = info
                         return record
-                    record["test"] = {"path": test_path, "content": test_code}
+                    record["test"] = {"path": test_path, "content": test_code, "failure": info[-3000:]}
                     patched, info, suspicion = self.fix(ws, target, triage, test_path, test_code, info, budget,
                                                         record["attempts"])
                     if patched is not None:
@@ -316,7 +322,8 @@ class Investigator:
                                 "seconds": round(time.time() - budget.started, 1)}
         record.update({
             "status": "proposed",
-            "diagnosis": info,
+            "diagnosis": info["diagnosis"],
+            "title": info["title"],
             "files": {target.path: {"before_sha1": sha1_text(original), "after": patched}},
             "diff": unified_diff({target.path: original}, {target.path: patched, test_path: test_code}),
         })

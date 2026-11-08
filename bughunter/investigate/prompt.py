@@ -26,6 +26,8 @@ Rules:
 - Assert the correct behaviour (what the code should do), so the assertion fails today.
 - Keep it small: one to three test functions, no network, no sleeping, temporary files only via tmp_path.
 - Use only the standard library and pytest.
+- No comments: work out expected values before writing the code, then put only the final values in it. \
+A one-line docstring per test is enough.
 - If, after looking at the code, you are confident the code is actually correct, set give_up to true \
 and leave test_code empty."""
 
@@ -40,7 +42,13 @@ ready to paste in place of the original.
 - Fix the cause, not the symptom: do not special-case the test's inputs, and do not change behaviour \
 the test does not need changed.
 - Do not add prints, logging or comments explaining the fix.
-- If the test itself is wrong rather than the code, set give_up to true and leave new_code empty."""
+- Do not add new definitions next to the old ones (such as a second `__init__`); change the code in place.
+- If the test itself is wrong rather than the code, set give_up to true and leave new_code empty.
+
+The diagnosis and title go into the pull request:
+- diagnosis: two or three sentences for a reviewer: what is wrong, for which input, and how the change fixes it. \
+Do not mention the test, earlier attempts or these instructions.
+- title: under 70 characters, saying what the fix does, e.g. "Convert grams to kg before computing shipping"."""
 
 
 @dataclass
@@ -81,10 +89,11 @@ def fix_schema() -> dict:
         "type": "object",
         "properties": {
             "diagnosis": {"type": "string"},
+            "title": {"type": "string"},
             "give_up": {"type": "boolean"},
             "new_code": {"type": "string"},
         },
-        "required": ["diagnosis", "give_up", "new_code"],
+        "required": ["diagnosis", "title", "give_up", "new_code"],
     }
 
 

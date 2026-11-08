@@ -41,6 +41,8 @@ CHUNK = 400  # files per ruff invocation, to stay under argv limits
 
 def run_ruff(repo: Path, paths: Sequence[str]) -> List[Finding]:
     findings: List[Finding] = []
+    # ruff reports resolved paths; resolve the root too, or symlinked temp dirs (macOS /var) don't match.
+    root = Path(repo).resolve()
     for i in range(0, len(paths), CHUNK):
         proc = subprocess.run(
             [
@@ -54,7 +56,7 @@ def run_ruff(repo: Path, paths: Sequence[str]) -> List[Finding]:
         if proc.returncode != 0:
             raise RuntimeError(f"ruff failed ({proc.returncode}): {proc.stderr.strip()[:500]}")
         for d in json.loads(proc.stdout or "[]"):
-            path = os.path.relpath(Path(d["filename"]).resolve(), repo)
+            path = os.path.relpath(Path(d["filename"]).resolve(), root)
             findings.append(
                 Finding(
                     source="ruff",

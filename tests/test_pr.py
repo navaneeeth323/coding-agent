@@ -69,10 +69,14 @@ def _verified(idx):
         idx.conn.execute("UPDATE candidates SET state = 'verified', data = ? WHERE id = ?", (json.dumps({
             "triage": {"p_real": 0.9, "category": "undefined_name", "model": "m"},
             "investigation": {
-                "status": "proposed", "diagnosis": "typo in return",
+                "status": "proposed", "diagnosis": "typo in return", "title": "return the sum, not `totl`.",
                 "files": {"pkg/core.py": {"before_sha1": sha1_text(ORIGINAL), "after": FIXED}},
-                "test": {"path": "tests/test_bughunter_1.py", "content": TEST}, "diff": "-x\n+y\n"},
-            "verification": {"passed": True, "checks": [{"name": "suite", "ok": True, "detail": "ok"}]},
+                "test": {"path": "tests/test_bughunter_1.py", "content": TEST,
+                         "failure": "    def test_total():\n>       assert total([1]) == 1\nE   NameError: name 'totl'"},
+                "diff": "--- a/pkg/core.py\n+++ b/pkg/core.py\n-    return totl\n+    return sum(items)\n"
+                        "--- /dev/null\n+++ b/tests/test_bughunter_1.py\n+from pkg.core import total\n"},
+            "verification": {"passed": True, "checks": [
+                {"name": "scope", "ok": True, "detail": ""}, {"name": "suite", "ok": True, "detail": "3 passed"}]},
         }), cid))
     return cid
 
@@ -90,7 +94,12 @@ def test_dry_run_then_push(repo):
         gh = FakeGitHub()
         plan = open_pr(idx, cid, github=gh)
         assert plan.url is None and plan.branch == f"bughunter/{cid}-total"
-        assert "```python\nfrom pkg.core import total" in plan.body and "P(real bug): 0.9" in plan.body
+        assert plan.title == "Return the sum, not `totl`"
+        assert "```python\nfrom pkg.core import total" in plan.body and "confidence that this is a real bug: 0.9" in plan.body
+        assert "fails with:\n\n```\nE   NameError: name 'totl'\n```" in plan.body
+        fix = plan.body.split("## Fix")[1]
+        assert "+    return sum(items)" in fix and "test_bughunter_1" not in fix
+        assert "✅ Existing test suite has no new failures (3 passed)" in plan.body and "scope" not in plan.body
         assert not git(repo, "ls-remote", "--heads", "origin").strip()  # nothing pushed
 
         plan = open_pr(idx, cid, push=True, github=gh)

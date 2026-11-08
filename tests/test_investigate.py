@@ -6,10 +6,12 @@ import pytest
 from bughunter.candidates import store
 from bughunter.index import RepoIndex
 from bughunter.investigate import InvestigateConfig, investigate
-from bughunter.investigate.edits import changed_lines, module_name, replace_region, strip_fences
+from bughunter.investigate.edits import (
+    changed_lines, clean_test_code, module_name, new_redefinitions, replace_region, strip_fences,
+)
 from bughunter.llm import ChatResult
 from bughunter.pipeline import collect_candidates
-from bughunter.sandbox import LocalSandbox
+from bughunter.sandbox import LocalSandbox, sha1_text
 from bughunter.verify import verify
 
 
@@ -209,3 +211,91 @@ def test_one_investigation_per_function(repo, sandbox):
         assert "line 9 (LLM): returns a misspelled name" in llm.prompts[0][1]["content"]  # sibling shown as context
         row = idx.conn.execute("SELECT state, data FROM candidates WHERE id = ?", (sibling,)).fetchone()
         assert row["state"] == "rejected" and json.loads(row["data"])["merged_into"] == cid
+
+
+def test_clean_test_code():
+    raw = textwrap.dedent("""
+        import os
+        import pytest  # noqa: F401
+        from pkg.core import total
+
+
+        def test_total():
+            \"\"\"Sums.\"\"\"
+            # tax on 100 is 8, wait let's check
+            items = [1, 2]   # two items
+
+
+            # expected: 3
+            assert total(items) == 3   
+        """).lstrip()
+    assert clean_test_code(raw) == textwrap.dedent("""
+        import pytest  # noqa: F401
+        from pkg.core import total
+
+
+        def test_total():
+            \"\"\"Sums.\"\"\"
+            items = [1, 2]
+
+            assert total(items) == 3
+        """).lstrip()
+    assert clean_test_code("def broken(:\n") == "def broken(:\n"
+
+
+def test_new_redefinitions():
+    before = "class A:\n    def __init__(self, x=[]):\n        self.x = x\n\n    def add(self):\n        pass\n"
+    after = before.replace("    def add(self):", "    def __init__(self, x=None):\n        self.x = x\n\n    def add(self):")
+    assert new_redefinitions(before, after) == ["A.__init__"]
+    setter = "class B:\n    @property\n    def v(self):\n        return 1\n\n    @v.setter\n    def v(self, x):\n        pass\n"
+    assert new_redefinitions(setter, setter) == [] and new_redefinitions(before, before) == []
+
+
+FIX_REDEFINES = {"diagnosis": "d", "title": "t", "give_up": False,
+                 "new_code": "def total(items):\n    return sum(items)\n\n\ndef double(x):\n    return x + x\n"}
+
+
+def test_fix_that_redefines_a_name_is_rejected(repo, sandbox):
+    with RepoIndex(repo) as idx:
+        cid = _triaged(idx)
+        fix_ok = {**FIX_OK, "title": "Return the computed sum."}
+        llm = ScriptedLLM(repro=[REPRO_OK], fix=[FIX_REDEFINES, fix_ok])
+        assert investigate(idx, llm, sandbox, InvestigateConfig(use_cache=False)).proposed == 1
+        inv = json.loads(idx.conn.execute("SELECT data FROM candidates WHERE id = ?", (cid,)).fetchone()[0])[
+            "investigation"]
+        assert "defines `double` a second time" in inv["attempts"][1]["problem"]
+        assert inv["title"] == "Return the computed sum." and "NameError" in inv["test"]["failure"]
+
+
+def _proposal(idx, fingerprint, symbol, test_path, test_code, after):
+    run = store.start_run(idx.conn, "test")
+    with idx.conn:
+        store.upsert(idx.conn, run, {
+            "fingerprint": fingerprint, "source": "llm", "rule": "LLM", "path": "pkg/core.py", "line": 5,
+            "col": 1, "end_line": 5, "message": "m", "symbol": symbol, "symbol_start": 5, "symbol_end": 9,
+            "code_sha1": "x", "score": 0.5,
+        })
+    cid = idx.conn.execute("SELECT id FROM candidates WHERE fingerprint = ?", (fingerprint,)).fetchone()[0]
+    original = (idx.repo / "pkg/core.py").read_text()
+    store.transition(idx.conn, cid, "triaged")
+    store.transition(idx.conn, cid, "investigating", data={"investigation": {
+        "status": "proposed", "diagnosis": "d", "files": {"pkg/core.py": {"before_sha1": sha1_text(original),
+                                                                           "after": after}},
+        "test": {"path": test_path, "content": test_code}, "diff": ""}})
+    return cid
+
+
+def test_verify_rejects_second_fix_for_the_same_bug(repo, sandbox):
+    fixed = (repo / "pkg/core.py").read_text().replace("return totl", "return s")
+    other = (repo / "pkg/core.py").read_text().replace("return totl", "return sum(items)")
+    with RepoIndex(repo) as idx:
+        store.ensure_schema(idx.conn)
+        a = _proposal(idx, "a", "total", "tests/test_a.py",
+                      "from pkg.core import total\n\n\ndef test_a():\n    assert total([1, 2]) == 3\n", fixed)
+        b = _proposal(idx, "b", "double", "tests/test_b.py",
+                      "from pkg.core import total\n\n\ndef test_b():\n    assert total([]) == 0\n", other)
+        stats = verify(idx, sandbox)
+        assert (stats.verified, stats.rejected) == (1, 1)
+        rows = {r["id"]: r for r in idx.conn.execute("SELECT id, state, data FROM candidates")}
+        assert rows[a]["state"] == "verified" and rows[b]["state"] == "rejected"
+        assert json.loads(rows[b]["data"])["verification"]["merged_into"] == a
